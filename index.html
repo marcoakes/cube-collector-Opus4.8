@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cube Collector 3D</title>
+<style>
+  /* ===================== BASE / LAYOUT ===================== */
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; font-family: "Segoe UI", system-ui, sans-serif; }
+  #game { position: fixed; inset: 0; }
+  canvas { display: block; }
+
+  /* ===================== HUD ===================== */
+  .hud { position: fixed; z-index: 10; color: #fff; text-shadow: 0 2px 6px rgba(0,0,0,.6); user-select: none; pointer-events: none; }
+  #score { top: 18px; left: 22px; font-size: 26px; font-weight: 700; letter-spacing: .5px; }
+  #score small { display:block; font-size: 12px; opacity:.7; font-weight:400; letter-spacing:2px; }
+  #timer { top: 18px; left: 50%; transform: translateX(-50%); font-size: 28px; font-weight: 700; }
+  #timer small { display:block; text-align:center; font-size: 11px; opacity:.7; font-weight:400; letter-spacing:2px; }
+
+  #healthWrap { top: 20px; right: 22px; width: 220px; text-align: right; }
+  #healthWrap .label { font-size: 12px; opacity:.8; letter-spacing:2px; margin-bottom:5px; }
+  #healthBar { width: 100%; height: 20px; background: rgba(255,255,255,.15); border-radius: 12px; overflow: hidden; box-shadow: inset 0 0 6px rgba(0,0,0,.5); }
+  #healthFill { height: 100%; width: 100%; border-radius: 12px; background: linear-gradient(90deg,#39d353,#a6ff4d); transition: width .2s ease, background .2s ease; }
+
+  /* ===================== OVERLAY SCREENS ===================== */
+  .overlay { position: fixed; inset: 0; z-index: 20; display: flex; flex-direction: column; align-items: center; justify-content: center;
+             background: radial-gradient(ellipse at center, rgba(20,24,48,.82), rgba(4,6,18,.95)); color: #fff; text-align: center; padding: 24px; }
+  .overlay h1 { font-size: 52px; letter-spacing: 2px; margin-bottom: 8px; background: linear-gradient(90deg,#7ee8ff,#a6ff4d); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .overlay h2 { font-size: 34px; margin-bottom: 14px; color:#ff8a8a; }
+  .overlay p { font-size: 16px; opacity: .9; max-width: 560px; line-height: 1.7; margin-bottom: 10px; }
+  .overlay .keys { margin: 16px 0 26px; font-size: 15px; opacity:.85; line-height: 2; }
+  .overlay .keys b { color:#a6ff4d; }
+  .btn { pointer-events: auto; cursor: pointer; border: none; padding: 15px 42px; font-size: 20px; font-weight: 700; letter-spacing: 1px;
+         border-radius: 40px; color: #05210f; background: linear-gradient(90deg,#39d353,#a6ff4d); box-shadow: 0 8px 26px rgba(80,255,120,.35); transition: transform .12s ease; }
+  .btn:hover { transform: translateY(-2px) scale(1.03); }
+  .finalScore { font-size: 26px; margin: 6px 0 22px; }
+  .finalScore b { color:#a6ff4d; }
+  .hidden { display: none !important; }
+
+  /* Damage flash overlay */
+  #flash { position: fixed; inset: 0; z-index: 15; background: rgba(255,40,40,.0); pointer-events: none; transition: background .05s linear; }
+</style>
+</head>
+<body>
+<div id="game"></div>
+
+<!-- ===================== HUD ELEMENTS ===================== -->
+<div id="score" class="hud">0<small>SCORE</small></div>
+<div id="timer" class="hud">00:00<small>TIME</small></div>
+<div id="healthWrap" class="hud">
+  <div class="label">HEALTH</div>
+  <div id="healthBar"><div id="healthFill"></div></div>
+</div>
+<div id="flash"></div>
+
+<!-- ===================== START SCREEN ===================== -->
+<div id="startScreen" class="overlay">
+  <h1>CUBE COLLECTOR</h1>
+  <p>Roam the neon arena. Grab the glowing cubes for points. Dodge the red hunters — they want you.</p>
+  <div class="keys">
+    <b>WASD / Arrows</b> — Move &nbsp;•&nbsp; <b>Space</b> — Jump<br>
+    <b>Mouse drag</b> — Orbit camera &nbsp;•&nbsp; Collect <b>+10</b> &nbsp;•&nbsp; Hit <b>−25 HP</b>
+  </div>
+  <button class="btn" id="startBtn">START</button>
+</div>
+
+<!-- ===================== GAME OVER SCREEN ===================== -->
+<div id="overScreen" class="overlay hidden">
+  <h2>GAME OVER</h2>
+  <div class="finalScore">Final Score: <b id="finalScore">0</b></div>
+  <button class="btn" id="restartBtn">PLAY AGAIN</button>
+</div>
+
+<!-- Three.js via CDN -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+/* =====================================================================
+   CUBE COLLECTOR 3D
+   Single-file Three.js game. Sections:
+     1. Audio engine (Web Audio API, procedural SFX)
+     2. Scene / camera / lights / ground / skybox
+     3. Player (mesh + physics)
+     4. Entity systems (collectibles, enemies, particles)
+     5. Input (keyboard + mouse-orbit camera)
+     6. Game state / HUD / spawning / difficulty
+     7. Collision + update loop
+   ===================================================================== */
+
+/* ======================= 1. AUDIO ENGINE ======================= *
+ * All sounds are synthesized at runtime — no external assets.      */
+const Audio = (() => {
+  let ctx = null;
+  function ensure() { if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)(); return ctx; }
+  // Generic tone helper with envelope
+  function tone(freq, dur, type, gainPeak, glideTo) {
+    const c = ensure();
+    const osc = c.createOscillator(), g = c.createGain();
+    osc.type = type; osc.frequency.setValueAtTime(freq, c.currentTime);
+    if (glideTo) osc.frequency.exponentialRampToValueAtTime(glideTo, c.currentTime + dur);
+    g.gain.setValueAtTime(0.0001, c.currentTime);
+    g.gain.exponentialRampToValueAtTime(gainPeak, c.currentTime + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, c.currentTime + dur);
+    osc.connect(g).connect(c.destination);
+    osc.start(); osc.stop(c.currentTime + dur);
+  }
+  return {
+    resume() { ensure().resume(); },
+    collect() { tone(660, 0.12, 'triangle', 0.25, 1320); tone(990, 0.16, 'sine', 0.15); },
+    damage()  { tone(180, 0.3, 'sawtooth', 0.3, 60); },
+    jump()    { tone(300, 0.18, 'square', 0.18, 620); }
+  };
+})();
+
+/* ======================= 2. SCENE SETUP ======================= */
+const container = document.getElementById('game');
+const scene = new THREE.Scene();
+
+// Gradient "sky" background rendered onto a canvas texture
+function makeSky() {
+  const cv = document.createElement('canvas'); cv.width = 16; cv.height = 256;
+  const g = cv.getContext('2d').createLinearGradient(0, 0, 0, 256);
+  g.addColorStop(0, '#0b1030'); g.addColorStop(0.5, '#243b73'); g.addColorStop(1, '#5f83c9');
+  const c2 = cv.getContext('2d'); c2.fillStyle = g; c2.fillRect(0, 0, 16, 256);
+  const tex = new THREE.CanvasTexture(cv); return tex;
+}
+scene.background = makeSky();
+scene.fog = new THREE.Fog(0x243b73, 40, 120);
+
+// Renderer with shadows
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+container.appendChild(renderer.domElement);
+
+// Perspective camera (positioned each frame by the follow rig)
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 500);
+
+// Lighting: ambient fill + directional sun casting shadows
+scene.add(new THREE.AmbientLight(0x8899cc, 0.6));
+const sun = new THREE.DirectionalLight(0xffffff, 1.0);
+sun.position.set(25, 40, 20);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.near = 1; sun.shadow.camera.far = 140;
+sun.shadow.camera.left = -60; sun.shadow.camera.right = 60;
+sun.shadow.camera.top = 60; sun.shadow.camera.bottom = -60;
+scene.add(sun);
+
+// Ground plane with a procedural checker/grid texture
+function makeGroundTexture() {
+  const s = 512, cv = document.createElement('canvas'); cv.width = cv.height = s;
+  const g = cv.getContext('2d');
+  g.fillStyle = '#20264a'; g.fillRect(0, 0, s, s);
+  g.strokeStyle = '#39406e'; g.lineWidth = 2;
+  for (let i = 0; i <= s; i += 32) { g.beginPath(); g.moveTo(i, 0); g.lineTo(i, s); g.stroke(); g.beginPath(); g.moveTo(0, i); g.lineTo(s, i); g.stroke(); }
+  const tex = new THREE.CanvasTexture(cv);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping; tex.repeat.set(20, 20);
+  return tex;
+}
+const ARENA = 55; // half-size of the play area (walls at +/- ARENA)
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(ARENA * 2, ARENA * 2),
+  new THREE.MeshStandardMaterial({ map: makeGroundTexture(), roughness: 0.95, metalness: 0.05 })
+);
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// Simple glowing boundary frame so the player senses the arena edge
+const edgeMat = new THREE.LineBasicMaterial({ color: 0x7ee8ff });
+const edgeGeo = new THREE.BufferGeometry().setFromPoints([
+  new THREE.Vector3(-ARENA, 0.1, -ARENA), new THREE.Vector3(ARENA, 0.1, -ARENA),
+  new THREE.Vector3(ARENA, 0.1, ARENA), new THREE.Vector3(-ARENA, 0.1, ARENA), new THREE.Vector3(-ARENA, 0.1, -ARENA)
+]);
+scene.add(new THREE.Line(edgeGeo, edgeMat));
+
+/* ======================= 3. PLAYER ======================= */
+const player = new THREE.Mesh(
+  new THREE.SphereGeometry(1, 32, 32),
+  new THREE.MeshStandardMaterial({ color: 0x7ee8ff, emissive: 0x184a66, roughness: 0.3, metalness: 0.4 })
+);
+player.castShadow = true;
+player.position.set(0, 1, 0);
+scene.add(player);
+
+// Player physics state
+const P = {
+  vel: new THREE.Vector3(),   // XZ velocity
+  velY: 0,                    // vertical velocity
+  onGround: true,
+  radius: 1,
+  accel: 55,                  // input acceleration
+  friction: 6,                // velocity damping
+  maxSpeed: 18,
+  jumpForce: 14,
+  gravity: 38,
+  invuln: 0                   // invulnerability timer (s)
+};
+
+/* ======================= 4. ENTITY SYSTEMS ======================= */
+const collectibles = [];
+const enemies = [];
+const particles = [];
+
+// Reusable random position inside the arena (with margin)
+function randPos(y) {
+  const m = ARENA - 5;
+  return new THREE.Vector3((Math.random() * 2 - 1) * m, y, (Math.random() * 2 - 1) * m);
+}
+
+function spawnCollectible() {
+  const mesh = new THREE.Mesh(
+    new THREE.BoxGeometry(1.2, 1.2, 1.2),
+    new THREE.MeshStandardMaterial({ color: 0xa6ff4d, emissive: 0x2f6b12, roughness: 0.35, metalness: 0.3 })
+  );
+  mesh.castShadow = true;
+  mesh.position.copy(randPos(1.4));
+  mesh.userData.spin = 1 + Math.random() * 2;
+  scene.add(mesh);
+  collectibles.push(mesh);
+}
+
+function spawnEnemy() {
+  const mesh = new THREE.Mesh(
+    new THREE.BoxGeometry(1.6, 1.6, 1.6),
+    new THREE.MeshStandardMaterial({ color: 0xff4d5e, emissive: 0x5c0d16, roughness: 0.5, metalness: 0.2 })
+  );
+  mesh.castShadow = true;
+  // Spawn away from the player so it isn't an instant hit
+  let p; do { p = randPos(0.9); } while (p.distanceTo(player.position) < 18);
+  mesh.position.copy(p);
+  mesh.userData.speed = 4 + Math.random() * 2;
+  scene.add(mesh);
+  enemies.push(mesh);
+}
+
+// Burst of small cubes as a collect particle effect
+function burst(pos, color) {
+  for (let i = 0; i < 14; i++) {
+    const m = new THREE.Mesh(
+      new THREE.BoxGeometry(0.25, 0.25, 0.25),
+      new THREE.MeshBasicMaterial({ color })
+    );
+    m.position.copy(pos);
+    m.userData.vel = new THREE.Vector3((Math.random() * 2 - 1) * 8, Math.random() * 9 + 2, (Math.random() * 2 - 1) * 8);
+    m.userData.life = 0.7;
+    scene.add(m);
+    particles.push(m);
+  }
+}
+
+/* ======================= 5. INPUT ======================= */
+const keys = {};
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// Mouse-orbit camera rig (spherical around player)
+const cam = { yaw: 0, pitch: 0.5, dist: 16 };
+let dragging = false, lastX = 0, lastY = 0;
+renderer.domElement.addEventListener('mousedown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+window.addEventListener('mouseup', () => dragging = false);
+window.addEventListener('mousemove', e => {
+  if (!dragging) return;
+  cam.yaw   -= (e.clientX - lastX) * 0.005;
+  cam.pitch -= (e.clientY - lastY) * 0.005;
+  cam.pitch = Math.max(0.15, Math.min(1.3, cam.pitch)); // clamp vertical
+  lastX = e.clientX; lastY = e.clientY;
+});
+// Wheel to zoom
+renderer.domElement.addEventListener('wheel', e => {
+  cam.dist = Math.max(8, Math.min(30, cam.dist + e.deltaY * 0.02));
+  e.preventDefault();
+}, { passive: false });
+
+/* ======================= 6. GAME STATE / HUD ======================= */
+const UI = {
+  score: document.getElementById('score'),
+  timer: document.getElementById('timer'),
+  healthFill: document.getElementById('healthFill'),
+  flash: document.getElementById('flash'),
+  start: document.getElementById('startScreen'),
+  over: document.getElementById('overScreen'),
+  finalScore: document.getElementById('finalScore')
+};
+
+let state = 'start';   // 'start' | 'playing' | 'over'
+let score = 0, health = 100, elapsed = 0;
+let collectTimer = 0, enemyTimer = 0, shake = 0;
+
+function resetGame() {
+  // Clear all entities
+  [...collectibles, ...enemies, ...particles].forEach(m => scene.remove(m));
+  collectibles.length = enemies.length = particles.length = 0;
+  // Reset player
+  player.position.set(0, 1, 0);
+  P.vel.set(0, 0, 0); P.velY = 0; P.onGround = true; P.invuln = 0;
+  score = 0; health = 100; elapsed = 0; collectTimer = 0; enemyTimer = 0; shake = 0;
+  // Initial entities
+  for (let i = 0; i < 6; i++) spawnCollectible();
+  for (let i = 0; i < 3; i++) spawnEnemy();
+  updateHUD();
+}
+
+function updateHUD() {
+  UI.score.firstChild.textContent = score;
+  UI.healthFill.style.width = Math.max(0, health) + '%';
+  UI.healthFill.style.background = health > 50
+    ? 'linear-gradient(90deg,#39d353,#a6ff4d)'
+    : health > 25 ? 'linear-gradient(90deg,#e8b23a,#ffd24d)'
+    : 'linear-gradient(90deg,#e83a3a,#ff7a4d)';
+  const mm = String(Math.floor(elapsed / 60)).padStart(2, '0');
+  const ss = String(Math.floor(elapsed % 60)).padStart(2, '0');
+  UI.timer.firstChild.textContent = mm + ':' + ss;
+}
+
+function startGame() { Audio.resume(); resetGame(); state = 'playing'; UI.start.classList.add('hidden'); UI.over.classList.add('hidden'); }
+function gameOver() { state = 'over'; UI.finalScore.textContent = score; UI.over.classList.remove('hidden'); }
+
+document.getElementById('startBtn').onclick = startGame;
+document.getElementById('restartBtn').onclick = startGame;
+
+/* ======================= 7. UPDATE / COLLISION LOOP ======================= */
+const clock = new THREE.Clock();
+const forward = new THREE.Vector3(), right = new THREE.Vector3();
+
+function update(dt) {
+  if (state !== 'playing') return;
+  elapsed += dt;
+
+  /* --- Movement: build input vector relative to camera yaw --- */
+  forward.set(Math.sin(cam.yaw), 0, Math.cos(cam.yaw));   // camera-forward on XZ
+  right.set(forward.z, 0, -forward.x);
+  const move = new THREE.Vector3();
+  if (keys['KeyW'] || keys['ArrowUp'])    move.sub(forward);
+  if (keys['KeyS'] || keys['ArrowDown'])  move.add(forward);
+  if (keys['KeyA'] || keys['ArrowLeft'])  move.sub(right);
+  if (keys['KeyD'] || keys['ArrowRight']) move.add(right);
+  if (move.lengthSq() > 0) {
+    move.normalize();
+    P.vel.addScaledVector(move, P.accel * dt);        // acceleration
+  }
+  // Friction (exponential damping) + speed clamp
+  P.vel.multiplyScalar(Math.max(0, 1 - P.friction * dt));
+  if (P.vel.length() > P.maxSpeed) P.vel.setLength(P.maxSpeed);
+  player.position.addScaledVector(P.vel, dt);
+
+  /* --- Jump + gravity --- */
+  if ((keys['Space']) && P.onGround) { P.velY = P.jumpForce; P.onGround = false; Audio.jump(); }
+  P.velY -= P.gravity * dt;
+  player.position.y += P.velY * dt;
+  if (player.position.y <= 1) { player.position.y = 1; P.velY = 0; P.onGround = true; }
+
+  // Keep player inside the arena walls
+  const b = ARENA - P.radius;
+  player.position.x = Math.max(-b, Math.min(b, player.position.x));
+  player.position.z = Math.max(-b, Math.min(b, player.position.z));
+
+  if (P.invuln > 0) P.invuln -= dt;
+  // Blink player while invulnerable
+  player.visible = !(P.invuln > 0 && Math.floor(elapsed * 12) % 2 === 0);
+
+  /* --- Collectibles: spin + pickup --- */
+  for (let i = collectibles.length - 1; i >= 0; i--) {
+    const c = collectibles[i];
+    c.rotation.x += c.userData.spin * dt;
+    c.rotation.y += c.userData.spin * dt;
+    c.position.y = 1.4 + Math.sin(elapsed * 2 + i) * 0.25; // gentle bob
+    if (c.position.distanceTo(player.position) < P.radius + 1) {
+      burst(c.position, 0xa6ff4d);
+      scene.remove(c); collectibles.splice(i, 1);
+      score += 10; Audio.collect(); updateHUD();
+      spawnCollectible(); // maintain supply
+    }
+  }
+
+  /* --- Enemies: chase AI + damage --- */
+  for (const e of enemies) {
+    const dir = player.position.clone().sub(e.position); dir.y = 0;
+    if (dir.lengthSq() > 0.001) { dir.normalize(); e.position.addScaledVector(dir, e.userData.speed * dt); }
+    e.rotation.y += dt * 1.5;
+    if (P.invuln <= 0 && e.position.distanceTo(player.position) < P.radius + 1.1) {
+      health -= 25; P.invuln = 1.2; shake = 0.5;
+      Audio.damage(); triggerFlash(); updateHUD();
+      if (health <= 0) { gameOver(); return; }
+    }
+  }
+
+  /* --- Particles: ballistic + fade --- */
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.userData.vel.y -= 20 * dt;
+    p.position.addScaledVector(p.userData.vel, dt);
+    p.userData.life -= dt;
+    p.scale.multiplyScalar(1 - 2 * dt);
+    if (p.userData.life <= 0) { scene.remove(p); particles.splice(i, 1); }
+  }
+
+  /* --- Difficulty scaling: spawn more enemies over time --- */
+  collectTimer += dt; enemyTimer += dt;
+  if (collectTimer > 4 && collectibles.length < 12) { spawnCollectible(); collectTimer = 0; }
+  const enemyInterval = Math.max(3, 9 - elapsed * 0.05); // ramps down
+  if (enemyTimer > enemyInterval && enemies.length < 20) { spawnEnemy(); enemyTimer = 0; }
+}
+
+// Red damage flash
+function triggerFlash() {
+  UI.flash.style.background = 'rgba(255,40,40,.45)';
+  setTimeout(() => UI.flash.style.background = 'rgba(255,40,40,0)', 90);
+}
+
+/* --- Camera: smooth follow + orbit + screen shake --- */
+const camTarget = new THREE.Vector3(), desired = new THREE.Vector3();
+function updateCamera(dt) {
+  const cx = Math.sin(cam.yaw) * Math.cos(cam.pitch) * cam.dist;
+  const cy = Math.sin(cam.pitch) * cam.dist;
+  const cz = Math.cos(cam.yaw) * Math.cos(cam.pitch) * cam.dist;
+  desired.set(player.position.x + cx, player.position.y + cy, player.position.z + cz);
+  camera.position.lerp(desired, 1 - Math.pow(0.001, dt)); // frame-rate independent smoothing
+
+  camTarget.lerp(player.position, 1 - Math.pow(0.001, dt));
+  camera.lookAt(camTarget.x, camTarget.y + 1, camTarget.z);
+
+  if (shake > 0) {
+    shake = Math.max(0, shake - dt * 2);
+    camera.position.x += (Math.random() * 2 - 1) * shake;
+    camera.position.y += (Math.random() * 2 - 1) * shake;
+  }
+}
+
+/* ======================= MAIN LOOP ======================= */
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05); // clamp to avoid huge steps
+  update(dt);
+  updateCamera(dt);
+  renderer.render(scene, camera);
+}
+animate();
+
+// Responsive resize
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>
